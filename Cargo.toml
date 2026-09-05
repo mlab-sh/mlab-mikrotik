@@ -1,0 +1,68 @@
+[package]
+name = "mlab-mikrotik"
+version = "1.0.0"
+edition = "2021"
+description = "CLI to talk to MikroTik RouterOS devices over the REST API"
+license = "MIT"
+repository = "https://github.com/mlab-sh/mlab-mikrotik"
+homepage = "https://github.com/mlab-sh/mlab-mikrotik"
+readme = "README.md"
+keywords = ["mikrotik", "routeros", "network", "security", "cli"]
+categories = ["command-line-utilities", "network-programming"]
+
+# Debian packaging. The .deb ships on the GitHub release, nowhere else. The
+# release profile already strips the binary, so CI passes --no-strip: letting
+# cargo-deb strip it again would run the host strip against the aarch64 binary
+# and fail the cross build.
+# cargo-deb rewrites `target/release` to `target/<triple>/release` when it is
+# given --target, so one asset list covers both architectures.
+[package.metadata.deb]
+maintainer = "mlab <hello@mlab.sh>"
+section = "net"
+priority = "optional"
+extended-description = """\
+mlab-mikrotik reads a MikroTik router over the RouterOS REST API and turns what \
+it finds into graded security checks: who can log in and from where, what the \
+router listens on, whether the firewall closes, what a compromised host would \
+reach, and what changed since the last snapshot. It only reads, and nothing \
+leaves the machine unless a command says it does and you pass --allow-web."""
+depends = "$auto"
+assets = [
+    ["target/release/mlab-mikrotik", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/mlab-mikrotik/README.md", "644"],
+    ["LICENSE", "usr/share/doc/mlab-mikrotik/copyright", "644"],
+]
+
+# RPM packaging, for dnf/yum. Unlike cargo-deb, the source paths here are taken
+# literally, so CI stages the cross-built binary at pkg/mlab-mikrotik first
+# rather than relying on a target rewrite that would silently package the wrong
+# architecture. auto-req is off for the same reason: deriving requirements
+# means running the host's find-requires against a foreign binary.
+[package.metadata.generate-rpm]
+summary = "CLI over the RouterOS REST API, for passive network security work"
+license = "MIT"
+auto-req = "disabled"
+assets = [
+    { source = "pkg/mlab-mikrotik", dest = "/usr/bin/mlab-mikrotik", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/mlab-mikrotik/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/mlab-mikrotik/LICENSE", mode = "644", doc = true },
+]
+
+[[bin]]
+name = "mlab-mikrotik"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+colored = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true

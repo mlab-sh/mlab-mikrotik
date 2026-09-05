@@ -1,0 +1,846 @@
+//! Rendering.
+//!
+//! The default is a plain, quiet terminal render: two-space indent, dimmed
+//! labels, one blank line around each block. `-o json` switches every command
+//! to raw JSON on stdout, untouched and parsable — nothing is humanized there,
+//! so a pipeline always sees exactly what the router returned.
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use colored::Colorize;
+use serde_json::Value;
+
+/// Longest cell a table will print before truncating; a `host:port` and a
+/// RouterOS comment both fit comfortably.
+const MAX_CELL: usize = 44;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Human,
+    Json,
+}
+
+static FORMAT: AtomicU8 = AtomicU8::new(0);
+
+/// Resolve the format once at startup. Anything unknown means human.
+pub fn init(format: Option<&str>) {
+    let v = match format
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("json") => 1,
+        _ => 0,
+    };
+    FORMAT.store(v, Ordering::SeqCst);
+}
+
+pub fn format() -> Format {
+    match FORMAT.load(Ordering::SeqCst) {
+        1 => Format::Json,
+        _ => Format::Human,
+    }
+}
+
+pub fn is_json() -> bool {
+    format() == Format::Json
+}
+
+/// A table column: a header plus the JSON paths to try, in order.
+pub struct Col(pub &'static str, pub &'static [&'static str]);
+
+/// The columns of `profile list`.
+pub const PROFILE_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("DEFAULT", &["default"]),
+    Col("TARGET", &["target"]),
+    Col("USER", &["user"]),
+    Col("TLS", &["tls"]),
+];
+
+pub const POLICY_COLS: &[Col] = &[Col("POLICY", &["policy"]), Col("ALLOWS", &["allows"])];
+
+pub const SESSION_COLS: &[Col] = &[
+    Col("USER", &["name"]),
+    Col("FROM", &["address"]),
+    Col("VIA", &["via"]),
+    Col("SINCE", &["when"]),
+    Col("GROUP", &["group"]),
+];
+
+pub const PACKAGE_COLS: &[Col] = &[
+    Col("PACKAGE", &["name"]),
+    Col("VERSION", &["version"]),
+    Col("BUILT", &["build-time"]),
+];
+
+pub const HEALTH_COLS: &[Col] = &[
+    Col("SENSOR", &["name"]),
+    Col("VALUE", &["value"]),
+    Col("TYPE", &["type"]),
+];
+
+pub const INTERFACE_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("TYPE", &["type"]),
+    Col("STATE", &["state"]),
+    Col("ADDRESSES", &["addresses"]),
+    Col("MTU", &["mtu"]),
+    Col("MAC", &["mac"]),
+    Col("COMMENT", &["comment"]),
+];
+
+pub const COUNTER_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("RX ERR", &["rxError"]),
+    Col("TX ERR", &["txError"]),
+    Col("RX DROP", &["rxDrop"]),
+    Col("TX DROP", &["txDrop"]),
+    Col("QUEUE DROP", &["queueDrop"]),
+];
+
+pub const HOST_COLS: &[Col] = &[
+    Col("MAC", &["mac"]),
+    Col("ADDRESS", &["address"]),
+    Col("NAME", &["name"]),
+    Col("INTERFACE", &["interface"]),
+    Col("SEEN IN", &["seenIn"]),
+    Col("STATUS", &["status"]),
+    Col("LAST SEEN", &["lastSeen"]),
+];
+
+pub const NEIGHBOUR_COLS: &[Col] = &[
+    Col("IDENTITY", &["identity"]),
+    Col("ADDRESS", &["address"]),
+    Col("INTERFACE", &["interface"]),
+    Col("VIA", &["via"]),
+    Col("PLATFORM", &["platform"]),
+    Col("MAC", &["mac"]),
+    Col("AGE", &["age"]),
+];
+
+pub const ADDRESS_COLS: &[Col] = &[
+    Col("ADDRESS", &["address"]),
+    Col("NETWORK", &["network"]),
+    Col("INTERFACE", &["interface"]),
+    Col("RESOLVES TO", &["actual"]),
+    Col("ORIGIN", &["origin"]),
+];
+
+pub const BRIDGE_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("STATE", &["state"]),
+    Col("PORTS", &["ports"]),
+    Col("VLAN FILTERING", &["vlanFiltering"]),
+    Col("STP", &["protocolMode"]),
+    Col("DHCP SNOOPING", &["dhcpSnooping"]),
+];
+
+pub const BRIDGE_PORT_COLS: &[Col] = &[
+    Col("BRIDGE", &["bridge"]),
+    Col("INTERFACE", &["interface"]),
+    Col("PVID", &["pvid"]),
+    Col("FRAME TYPES", &["frameTypes"]),
+    Col("HORIZON", &["horizon"]),
+    Col("STATE", &["state"]),
+];
+
+pub const VLAN_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("VLAN", &["vlanId"]),
+    Col("ON", &["on"]),
+    Col("STATE", &["state"]),
+    Col("ADDRESSES", &["addresses"]),
+    Col("MTU", &["mtu"]),
+];
+
+pub const BRIDGE_VLAN_COLS: &[Col] = &[
+    Col("BRIDGE", &["bridge"]),
+    Col("VLAN IDS", &["vlanIds"]),
+    Col("TAGGED", &["tagged"]),
+    Col("UNTAGGED", &["untagged"]),
+    Col("ORIGIN", &["origin"]),
+];
+
+pub const DHCP_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("INTERFACE", &["interface"]),
+    Col("POOL", &["pool"]),
+    Col("LEASE TIME", &["leaseTime"]),
+    Col("STATE", &["state"]),
+];
+
+pub const POOL_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("RANGES", &["ranges"]),
+    Col("USED", &["used"]),
+    Col("AVAILABLE", &["available"]),
+    Col("TOTAL", &["total"]),
+];
+
+pub const FILTER_COLS: &[Col] = &[
+    Col("#", &["n"]),
+    Col("CHAIN", &["chain"]),
+    Col("ACTION", &["action"]),
+    Col("SRC", &["src"]),
+    Col("DST", &["dst"]),
+    Col("PROTO", &["proto"]),
+    Col("LOG", &["log"]),
+    Col("HITS", &["hits"]),
+    Col("STATE", &["state"]),
+    Col("COMMENT", &["comment"]),
+];
+
+pub const NAT_COLS: &[Col] = &[
+    Col("#", &["n"]),
+    Col("CHAIN", &["chain"]),
+    Col("ACTION", &["action"]),
+    Col("SRC", &["src"]),
+    Col("DST", &["dst"]),
+    Col("TO", &["to"]),
+    Col("PROTO", &["proto"]),
+    Col("COMMENT", &["comment"]),
+];
+
+pub const CHAIN_COLS: &[Col] = &[
+    Col("CHAIN", &["chain"]),
+    Col("RULES", &["rules"]),
+    Col("ACCEPTS", &["accepts"]),
+    Col("REFUSALS", &["refusals"]),
+    Col("CLOSES", &["closes"]),
+];
+
+pub const ADDRESS_LIST_COLS: &[Col] = &[
+    Col("LIST", &["list"]),
+    Col("ENTRIES", &["entries"]),
+    Col("DYNAMIC", &["dynamic"]),
+];
+
+pub const SERVICE_COLS: &[Col] = &[
+    Col("SERVICE", &["service"]),
+    Col("PORT", &["port"]),
+    Col("AVAILABLE FROM", &["availableFrom"]),
+    Col("VRF", &["vrf"]),
+];
+
+pub const FORWARD_COLS: &[Col] = &[
+    Col("PROTO", &["proto"]),
+    Col("PORT", &["port"]),
+    Col("FROM", &["from"]),
+    Col("TO", &["to"]),
+    Col("COMMENT", &["comment"]),
+];
+
+pub const TOGGLE_COLS: &[Col] = &[
+    Col("FEATURE", &["feature"]),
+    Col("STATE", &["state"]),
+    Col("DETAIL", &["detail"]),
+];
+
+pub const POSTURE_COLS: &[Col] = &[
+    Col("SETTING", &["setting"]),
+    Col("STATE", &["state"]),
+    Col("DETAIL", &["detail"]),
+];
+
+pub const ACCOUNT_COLS: &[Col] = &[
+    Col("USER", &["user"]),
+    Col("GROUP", &["group"]),
+    Col("LOGS IN FROM", &["from"]),
+    Col("WRITES", &["writes"]),
+    Col("SECRETS", &["secrets"]),
+    Col("LAST LOGIN", &["lastLogin"]),
+];
+
+pub const LOGGING_COLS: &[Col] = &[
+    Col("TOPICS", &["topics"]),
+    Col("ACTION", &["action"]),
+    Col("TARGET", &["target"]),
+    Col("SURVIVES REBOOT", &["durable"]),
+];
+
+pub const RADIO_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("SSID", &["ssid"]),
+    Col("BAND", &["band"]),
+    Col("STATE", &["state"]),
+    Col("SECURITY", &["security"]),
+    Col("MAC", &["mac"]),
+];
+
+pub const WIFI_SECURITY_COLS: &[Col] = &[
+    Col("PROFILE", &["name"]),
+    Col("AUTH", &["auth"]),
+    Col("CIPHERS", &["ciphers"]),
+    Col("PMF", &["pmf"]),
+    Col("WPS", &["wps"]),
+    Col("KEY", &["key"]),
+];
+
+pub const WIFI_CLIENT_COLS: &[Col] = &[
+    Col("MAC", &["mac"]),
+    Col("INTERFACE", &["interface"]),
+    Col("SIGNAL", &["signal"]),
+    Col("UPTIME", &["uptime"]),
+    Col("RX", &["rx"]),
+    Col("TX", &["tx"]),
+];
+
+pub const LOG_RULE_COLS: &[Col] = &[
+    Col("TOPICS", &["topics"]),
+    Col("ACTION", &["action"]),
+    Col("TARGET", &["target"]),
+    Col("SURVIVES REBOOT", &["durable"]),
+    Col("PREFIX", &["prefix"]),
+];
+
+pub const LOG_COVERAGE_COLS: &[Col] = &[
+    Col("TOPIC", &["topic"]),
+    Col("ANSWERS AFTERWARDS", &["answers"]),
+    Col("RECORDED BY", &["action"]),
+    Col("SURVIVES REBOOT", &["durable"]),
+];
+
+pub const SEGMENT_COLS: &[Col] = &[
+    Col("INTERFACE", &["interface"]),
+    Col("ADDRESS", &["address"]),
+    Col("NETWORK", &["network"]),
+];
+
+pub const REACH_COLS: &[Col] = &[
+    Col("FROM", &["from"]),
+    Col("TO", &["to"]),
+    Col("STATE", &["state"]),
+    Col("RULES NAMING IT", &["rules"]),
+];
+
+pub const PUBLIC_ADDRESS_COLS: &[Col] = &[
+    Col("ADDRESS", &["address"]),
+    Col("INTERFACE", &["interface"]),
+    Col("ORIGIN", &["origin"]),
+];
+
+pub const OPERATOR_COLS: &[Col] = &[
+    Col("ADDRESS", &["address"]),
+    Col("AS", &["as"]),
+    Col("OPERATOR", &["isp"]),
+    Col("WHERE", &["where"]),
+    Col("HOSTING", &["hosting"]),
+];
+
+pub const SNAPSHOT_COLS: &[Col] = &[
+    Col("TAKEN", &["taken"]),
+    Col("ROWS", &["rows"]),
+    Col("SECRETS REMOVED", &["secretsRemoved"]),
+    Col("FILE", &["file"]),
+];
+
+pub const ROUTE_COLS: &[Col] = &[
+    Col("DESTINATION", &["dst"]),
+    Col("GATEWAY", &["gateway"]),
+    Col("DISTANCE", &["distance"]),
+    Col("TABLE", &["table"]),
+    Col("STATE", &["state"]),
+    Col("ORIGIN", &["origin"]),
+];
+
+// ---- blocks -----------------------------------------------------------------
+
+/// A section title, printed above a block.
+pub fn heading(text: &str) {
+    if is_json() {
+        return;
+    }
+    println!();
+    println!("  {}", text.bold());
+}
+
+/// The count line closing a list.
+pub fn count(n: usize, noun: &str) {
+    if is_json() {
+        return;
+    }
+    println!();
+    println!("  {}", format!("{n} {}", plural(noun, n)).dimmed());
+}
+
+/// English plural, enough for the nouns this CLI counts.
+fn plural(noun: &str, n: usize) -> String {
+    if n == 1 {
+        return noun.to_string();
+    }
+    match noun.chars().last() {
+        // "policy" -> "policies", but "day" -> "days": only a consonant before
+        // the y takes the -ies form.
+        Some('y') if !noun.ends_with(['a', 'e', 'i', 'o', 'u', 'y']) => noun.to_string(),
+        Some('y') => format!("{}ies", &noun[..noun.len() - 1]),
+        Some('s') | Some('x') | Some('z') => format!("{noun}es"),
+        _ => format!("{noun}s"),
+    }
+}
+
+/// An aligned key/value block, for status output the CLI composes itself
+/// rather than reading from the API.
+pub fn pairs(rows: &[(&str, String)]) {
+    if is_json() {
+        return;
+    }
+    let width = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    println!();
+    for (k, v) in rows {
+        println!("  {:<width$}  {}", k.dimmed(), tint(v));
+    }
+    println!();
+}
+
+/// Render one value: an object as a key/value block, anything else inline.
+pub fn one(v: &Value) {
+    if is_json() {
+        print_json(v);
+        return;
+    }
+    println!();
+    block(v, 2);
+    println!();
+}
+
+/// Render a list whose shape is only known at runtime, i.e. `api ... --list`:
+/// columns are the scalar fields of the first row.
+pub fn list_auto(rows: &[Value]) {
+    render(rows, &auto_spec(rows));
+}
+
+/// Render a list with known columns.
+pub fn list(rows: &[Value], cols: &[Col]) {
+    let spec: Vec<(String, Vec<String>)> = cols
+        .iter()
+        .map(|c| (c.0.to_string(), c.1.iter().map(|p| p.to_string()).collect()))
+        .collect();
+    render(rows, &spec);
+}
+
+fn auto_spec(rows: &[Value]) -> Vec<(String, Vec<String>)> {
+    const MAX_COLS: usize = 8;
+    let Some(map) = rows.first().and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<&String> = map
+        .iter()
+        .filter(|(_, v)| !matches!(v, Value::Object(_) | Value::Array(_)))
+        .map(|(k, _)| k)
+        .collect();
+    keys.sort_by_key(|k| (rank(k), k.to_string()));
+    keys.into_iter()
+        .take(MAX_COLS)
+        .map(|k| (k.to_uppercase(), vec![k.clone()]))
+        .collect()
+}
+
+fn render(rows: &[Value], spec: &[(String, Vec<String>)]) {
+    if is_json() {
+        print_json(&Value::Array(rows.to_vec()));
+        return;
+    }
+    if rows.is_empty() || spec.is_empty() {
+        println!();
+        println!("  {}", "no results".dimmed());
+        return;
+    }
+
+    // Keep only the columns that actually carry data on this console.
+    let used: Vec<&(String, Vec<String>)> = spec
+        .iter()
+        .filter(|c| {
+            let paths: Vec<&str> = c.1.iter().map(String::as_str).collect();
+            rows.iter().any(|r| !first(r, &paths).is_empty())
+        })
+        .collect();
+    if used.is_empty() {
+        println!();
+        println!("  {}", "no results".dimmed());
+        return;
+    }
+
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            used.iter()
+                .map(|c| {
+                    let paths: Vec<&str> = c.1.iter().map(String::as_str).collect();
+                    clip(&first(row, &paths))
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut widths: Vec<usize> = used.iter().map(|c| c.0.chars().count()).collect();
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            widths[i] = widths[i].max(c.chars().count());
+        }
+    }
+
+    println!();
+    let head: Vec<String> = used.iter().map(|c| c.0.clone()).collect();
+    println!("  {}", pad_join(&head, &widths, |s| s.dimmed().to_string()));
+    for row in &cells {
+        println!("  {}", pad_join(row, &widths, |s| tint(s).to_string()));
+    }
+}
+
+/// Pad every cell but the last to its column width, then colour it.
+fn pad_join(cells: &[String], widths: &[usize], paint: impl Fn(&str) -> String) -> String {
+    let mut out = String::new();
+    for (i, c) in cells.iter().enumerate() {
+        out.push_str(&paint(c));
+        if i + 1 != cells.len() {
+            out.push_str(&" ".repeat(widths[i].saturating_sub(c.chars().count()) + 2));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// A key/value block, recursing into nested objects and tables of objects.
+fn block(v: &Value, indent: usize) {
+    let pad = " ".repeat(indent);
+    let Some(map) = v.as_object() else {
+        println!("{pad}{}", tint(&scalar(v)));
+        return;
+    };
+
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort_by_key(|k| (rank(k), k.to_string()));
+
+    let width = keys
+        .iter()
+        .filter(|k| !matches!(map[**k], Value::Object(_) | Value::Array(_)))
+        .map(|k| k.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    // Scalars first, so the identity of the thing is at the top of the block.
+    for k in &keys {
+        match &map[*k] {
+            Value::Object(_) | Value::Array(_) => {}
+            val => println!("{pad}{:<width$}  {}", k.dimmed(), tint(&humanize(k, val))),
+        }
+    }
+
+    for k in &keys {
+        // A branch that would print nothing but its own title is noise.
+        if !has_content(&map[*k]) {
+            continue;
+        }
+        match &map[*k] {
+            Value::Array(items) if items.iter().all(|i| i.is_object()) => {
+                println!();
+                println!("{pad}{}", k.bold());
+                let spec = auto_spec(items);
+                for line in table_lines(items, &spec) {
+                    println!("{pad}  {line}");
+                }
+            }
+            Value::Array(items) => {
+                let joined = items.iter().map(scalar).collect::<Vec<_>>().join(", ");
+                println!("{pad}{:<width$}  {}", k.dimmed(), tint(&clip(&joined)));
+            }
+            Value::Object(_) => {
+                println!();
+                println!("{pad}{}", k.bold());
+                block(&map[*k], indent + 2);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The lines of a sub-table, so a nested block can indent them.
+fn table_lines(rows: &[Value], spec: &[(String, Vec<String>)]) -> Vec<String> {
+    if spec.is_empty() {
+        return Vec::new();
+    }
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            spec.iter()
+                .map(|c| {
+                    let paths: Vec<&str> = c.1.iter().map(String::as_str).collect();
+                    clip(&first(row, &paths))
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut widths: Vec<usize> = spec.iter().map(|c| c.0.chars().count()).collect();
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            widths[i] = widths[i].max(c.chars().count());
+        }
+    }
+
+    let mut out = vec![pad_join(
+        &spec.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+        &widths,
+        |s| s.dimmed().to_string(),
+    )];
+    out.extend(
+        cells
+            .iter()
+            .map(|r| pad_join(r, &widths, |s| tint(s).to_string())),
+    );
+    out
+}
+
+/// Print raw JSON on stdout. The only thing `-o json` ever emits.
+pub fn print_json(v: &Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+    );
+}
+
+// ---- helpers ----------------------------------------------------------------
+
+/// Whether a value carries anything printable, however deeply nested.
+fn has_content(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => m.values().any(has_content),
+        Value::Array(a) => a.iter().any(has_content),
+        Value::Null => false,
+        _ => true,
+    }
+}
+
+/// Identity fields float to the top of a block and to the left of a table.
+fn rank(key: &str) -> u8 {
+    match key {
+        "name" | "identity" => 0,
+        ".id" | "id" => 1,
+        "host" | "board-name" | "model" => 2,
+        "user" => 3,
+        "state" | "status" | "running" => 4,
+        "type" | "scheme" => 5,
+        "address" | "mac-address" => 6,
+        "disabled" | "enabled" => 7,
+        _ => 50,
+    }
+}
+
+/// Colour a cell by what it says: statuses read faster than they scan.
+fn tint(s: &str) -> colored::ColoredString {
+    match s {
+        "ONLINE" | "UP" | "CONNECTED" | "true" | "running" | "verified" => s.green(),
+        "active" | "bound" | "complete" | "enabled" | "on" => s.green(),
+        "off" | "none" | "masked" | "not set" | "—" => s.dimmed(),
+        "blocked" => s.green(),
+        "filtered" => s.yellow(),
+        "open" => s.red(),
+        "anywhere" => s.yellow(),
+        "accept" => s.green(),
+        "drop" | "reject" => s.red(),
+        "OFFLINE" | "DOWN" | "DISCONNECTED" | "not verified" | "down" => s.red(),
+        "disabled" | "inactive" | "dynamic" => s.dimmed(),
+        // `false` is an absence, not a fault — an inventory of disconnected
+        // clients must not read as a wall of errors.
+        "false" => s.dimmed(),
+        "PENDING" | "UPDATING" | "ADOPTING" | "UNKNOWN" => s.yellow(),
+        "current" | "supported" | "ok" => s.green(),
+        "appeared" => s.yellow(),
+        "disappeared" => s.dimmed(),
+        "changed" => s.cyan(),
+        "weak" | "medium" => s.yellow(),
+        "critical" => s.red().bold(),
+        "high" => s.red(),
+        "low" => s.dimmed(),
+        "unsupported" | "end of life" | "below minimum" => s.red(),
+        "update available" => s.yellow(),
+        "lts branch" | "unknown" => s.dimmed(),
+        "" => s.normal(),
+        _ => s.normal(),
+    }
+}
+
+/// Units the API leaves raw. Only applied to unambiguously named keys, and only
+/// in human mode — `-o json` keeps the original numbers.
+fn humanize(key: &str, v: &Value) -> String {
+    let raw = scalar(v);
+    let Some(n) = v.as_f64() else { return raw };
+
+    if key.ends_with("-load") && (0.0..=100.0).contains(&n) {
+        let filled = ((n / 10.0).round() as usize).min(10);
+        let bar: String = "█".repeat(filled) + &"·".repeat(10 - filled);
+        return format!("{n:>5.1}%  {}", bar.dimmed());
+    }
+    if key.ends_with("-rate") {
+        return format!("{raw}  {}", format!("({})", bitrate(n)).dimmed());
+    }
+    if key.ends_with("-seconds") && n >= 60.0 {
+        return format!("{raw}  {}", format!("({})", duration(n as u64)).dimmed());
+    }
+    raw
+}
+
+fn bitrate(bps: f64) -> String {
+    match bps {
+        b if b >= 1e9 => format!("{:.1} Gb/s", b / 1e9),
+        b if b >= 1e6 => format!("{:.1} Mb/s", b / 1e6),
+        b if b >= 1e3 => format!("{:.1} kb/s", b / 1e3),
+        b => format!("{b:.0} b/s"),
+    }
+}
+
+fn duration(secs: u64) -> String {
+    let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
+    match (d, h) {
+        (0, 0) => format!("{m}m"),
+        (0, _) => format!("{h}h{m:02}m"),
+        _ => format!("{d}d {h}h"),
+    }
+}
+
+/// First non-empty value among `paths`, as a display string.
+fn first(v: &Value, paths: &[&str]) -> String {
+    for p in paths {
+        if let Some(found) = dig(v, p) {
+            let s = scalar(found);
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    String::new()
+}
+
+/// Follow a dotted path into a JSON object.
+fn dig<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = v;
+    for part in path.split('.') {
+        cur = cur.get(part)?;
+    }
+    Some(cur)
+}
+
+/// One-line rendering of a value; nested ones fall back to compact JSON.
+fn scalar(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        // An empty list is an absence, not the two characters "[]", and a list
+        // of scalars reads better as a list than as JSON.
+        Value::Array(a) if a.is_empty() => String::new(),
+        Value::Array(a) if a.iter().all(|i| !i.is_object() && !i.is_array()) => {
+            a.iter().map(scalar).collect::<Vec<_>>().join(", ")
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Truncate an over-long cell so one field cannot wreck the alignment.
+fn clip(s: &str) -> String {
+    if s.chars().count() <= MAX_CELL {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(MAX_CELL - 1).collect();
+    format!("{kept}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn an_unknown_or_missing_format_falls_back_to_human() {
+        init(None);
+        assert_eq!(format(), Format::Human);
+        init(Some("banana"));
+        assert_eq!(format(), Format::Human);
+        init(Some("JSON"));
+        assert!(is_json(), "the format is matched case-insensitively");
+        init(None);
+    }
+
+    #[test]
+    fn auto_columns_are_scalars_only_with_identity_first() {
+        let rows = vec![json!({"zzz": 1, "name": "ether1", "vlans": [{"id": 1}], "id": "x"})];
+        let cols: Vec<String> = auto_spec(&rows).into_iter().map(|c| c.0).collect();
+        assert_eq!(
+            cols,
+            vec!["NAME", "ID", "ZZZ"],
+            "nested fields stay out of the table"
+        );
+    }
+
+    #[test]
+    fn a_path_can_be_dotted_with_fallbacks() {
+        let v = json!({"meta": {"name": "gw-01"}});
+        assert_eq!(first(&v, &["name", "meta.name"]), "gw-01");
+        assert_eq!(first(&v, &["nope"]), "");
+    }
+
+    #[test]
+    fn units_are_only_added_to_unambiguous_keys() {
+        assert!(humanize("cpu-load", &json!(67.1)).starts_with(" 67.1%"));
+        assert!(humanize("tx-rate", &json!(393791688.0)).contains("393.8 Mb/s"));
+        assert!(humanize("uptime-seconds", &json!(561466)).contains("6d 11h"));
+        assert_eq!(
+            humanize("cpu-count", &json!(4)),
+            "4",
+            "a plain number is left alone"
+        );
+        assert_eq!(
+            humanize("name", &json!("cpu-load")),
+            "cpu-load",
+            "strings are never rewritten"
+        );
+    }
+
+    #[test]
+    fn a_percentage_outside_the_scale_is_left_alone() {
+        assert_eq!(humanize("weird-load", &json!(420.0)), "420.0");
+    }
+
+    #[test]
+    fn a_branch_with_nothing_in_it_is_not_printable() {
+        assert!(!has_content(&json!({"bridge": {"ports": []}})));
+        assert!(!has_content(&json!({})));
+        assert!(has_content(&json!({"bridge": {"ports": [{"id": 1}]}})));
+        assert!(
+            has_content(&json!(false)),
+            "false is a value, not an absence"
+        );
+    }
+
+    #[test]
+    fn nouns_are_pluralized_rather_than_suffixed() {
+        assert_eq!(plural("instance", 2), "instances");
+        assert_eq!(plural("policy", 2), "policies", "not \"policys\"");
+        assert_eq!(plural("instance", 1), "instance");
+        assert_eq!(plural("route", 0), "routes", "none is still plural");
+    }
+
+    #[test]
+    fn lists_read_as_lists_and_an_empty_one_reads_as_nothing() {
+        assert_eq!(scalar(&json!([])), "", "an empty list is an absence");
+        assert_eq!(scalar(&json!(["ether1", "ether2"])), "ether1, ether2");
+        assert_eq!(
+            scalar(&json!([{"a": 1}])),
+            "[{\"a\":1}]",
+            "objects still fall back to JSON"
+        );
+    }
+
+    #[test]
+    fn long_cells_are_clipped_to_keep_columns_aligned() {
+        let long = "x".repeat(80);
+        assert_eq!(clip(&long).chars().count(), MAX_CELL);
+        assert!(clip(&long).ends_with('…'));
+        assert_eq!(clip("short"), "short");
+    }
+}
